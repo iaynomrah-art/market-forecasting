@@ -15,149 +15,191 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- NEW: Timeframe Mapping Engine ---
-# This translates URL parameters into TradingView logic and human-readable text for the AI.
+# --- Timeframe Mapping Engine ---
 TIMEFRAME_MAP = {
     "5m": {"tv_interval": Interval.INTERVAL_5_MINUTES, "text": "5 minutes"},
     "15m": {"tv_interval": Interval.INTERVAL_15_MINUTES, "text": "15 minutes"},
     "1h": {"tv_interval": Interval.INTERVAL_1_HOUR, "text": "1 hour"},
     "4h": {"tv_interval": Interval.INTERVAL_4_HOURS, "text": "4 hours"},
-    "1d": {"tv_interval": Interval.INTERVAL_1_DAY, "text": "1 day"}
+    "1d": {"tv_interval": Interval.INTERVAL_1_DAY, "text": "1 day"},
+    "1W": {"tv_interval": Interval.INTERVAL_1_WEEK, "text": "1 week"},
+    "1M": {"tv_interval": Interval.INTERVAL_1_MONTH, "text": "1 month"}
+}
+
+# --- Automatically pairs a Micro timeframe with its logical Macro timeframe ---
+MACRO_PAIRINGS = {
+    "5m": "1h",   # 5m micro looks at 1h macro
+    "15m": "4h",  # 15m micro looks at 4h macro
+    "1h": "1d",   # 1h micro looks at Daily macro
+    "4h": "1W",   # 4h micro looks at Weekly macro
+    "1d": "1M"    # Daily micro looks at Monthly macro
 }
 
 def get_latest_headlines():
     try:
         feed = feedparser.parse("https://www.forexlive.com/feed/news")
-        headlines = [entry.title for entry in feed.entries[:3]]
-        return " | ".join(headlines)
+        headlines_with_time = []
+        for entry in feed.entries[:3]:
+            title = entry.title
+            published_time = entry.get('published', 'Unknown time')
+            headlines_with_time.append(f"[{published_time}] {title}")
+        return " | ".join(headlines_with_time)
     except Exception:
         return "No significant news data available."
 
 def get_exchange_config(symbol):
-    if symbol == "XAUUSD":
-        return {"screener": "forex", "exchange": "FX_IDC"}
+    symbol = symbol.upper()
+    if symbol == "XAUUSD" or symbol == "GOLD":
+        return {"tv_symbol": "GOLD", "screener": "cfd", "exchange": "TVC"} 
     elif symbol == "BTCUSD":
-        return {"screener": "crypto", "exchange": "BINANCE"}
+        return {"tv_symbol": "BTCUSD", "screener": "crypto", "exchange": "COINBASE"}
     else:
-        return {"screener": "crypto", "exchange": "BINANCE"}
+        return {"tv_symbol": symbol, "screener": "crypto", "exchange": "BINANCE"}
 
-def ask_ollama(symbol, timeframe_text, historical_decision, ta_basis, headlines):
-    """Now forces Gemma 3 to explicitly state the timeframe of its prediction."""
-    system_prompt = f"""You are a strict, data-driven {symbol} trading algorithmic judge.
-    Asset: {symbol}
-    Time Horizon: The next {timeframe_text}
-    Historical Technical Decision: {historical_decision}
-    Technical Basis: {ta_basis}
-    Latest Breaking News: {headlines}
+def fetch_technical_data(config, tf_data):
+    handler = TA_Handler(
+        symbol=config["tv_symbol"],   
+        screener=config["screener"],      
+        exchange=config["exchange"],     
+        interval=tf_data["tv_interval"]  
+    )
+    analysis = handler.get_analysis()
     
-    You must choose ONLY "BUY" or "SELL".
+    raw_summary = analysis.summary["RECOMMENDATION"]
+    buy_votes = analysis.summary["BUY"]
+    sell_votes = analysis.summary["SELL"]
+    neutral_votes = analysis.summary["NEUTRAL"]
+    total = buy_votes + sell_votes + neutral_votes
     
-    Rule 1 (The Override): If the news is highly volatile and strongly contradicts the Historical Decision, output the direction the NEWS implies.
-    Rule 2 (The Agreement): If the news supports the Historical Decision, output the Historical Decision.
-    Rule 3 (The Default): If the news is boring or irrelevant, output the Historical Decision.
+    decision = "BUY" if buy_votes > sell_votes else "SELL"
+    if "BUY" in raw_summary: decision = "BUY"
+    elif "SELL" in raw_summary: decision = "SELL"
+
+    math_process = f"Analyzed {total} indicators. Results: {buy_votes} BUY, {sell_votes} SELL, {neutral_votes} NEUTRAL. Verdict: {decision}."
+
+    ind = analysis.indicators
+    rsi = round(ind.get("RSI", 0), 2)
+    macd = round(ind.get("MACD.macd", 0), 2)
+    ema_20 = round(ind.get("EMA20", 0), 2)
+    price = round(ind.get("close", 0), 2)
+
+    rsi_txt = f"RSI {rsi} (Overbought)" if rsi > 70 else f"RSI {rsi} (Oversold)" if rsi < 30 else f"RSI {rsi} (Neutral)"
+    macd_txt = f"MACD Bearish ({macd})" if macd < 0 else f"MACD Bullish ({macd})"
+    trend_txt = f"Price below 20 EMA" if price < ema_20 else f"Price above 20 EMA"
+    
+    return {
+        "decision": decision,
+        "process": math_process,
+        "basis": f"{trend_txt}. {macd_txt}. {rsi_txt}.",
+        "price": price
+    }
+
+def ask_ollama(symbol, micro_tf, macro_tf, micro_data, macro_data, headlines):
+    """Upgraded Prompt: Forced Binary Decision (No Hold)"""
+    system_prompt = f"""You are an elite, multi-timeframe {symbol} quantitative trading AI. Your job is to analyze the macro trend, the micro entry, and fundamental news to make a highly accurate trading decision.
+    
+    Asset Profile: {symbol} (If XAU/Gold, it is a safe-haven. If BTC, it is a risk-on asset).
+    
+    [1] MACRO TREND (The Big Picture - {macro_tf}):
+    - Verdict: {macro_data['decision']}
+    - Basis: {macro_data['basis']}
+    
+    [2] MICRO TREND (The Entry Setup - {micro_tf}):
+    - Verdict: {micro_data['decision']}
+    - Basis: {micro_data['basis']}
+    
+    [3] FUNDAMENTAL CATALYSTS (Recent News): 
+    {headlines}
+    
+    You must choose ONLY "BUY" or "SELL". There is no "HOLD" option. You must make a definitive call.
+    
+    YOUR DECISION RULES:
+    1. Trend Alignment: If the Macro Trend and Micro Trend align, that is your primary signal.
+    2. The Forced Gamble (Contradiction): If the Macro says BUY, but the Micro says SELL (or vice versa), you must weigh the technical momentum and the news to decide if it is a "BUY" (e.g., buying the dip) or a "SELL" (e.g., trend reversal). You MUST pick a side.
+    3. The Catalyst Override: If fresh, highly impactful geopolitical/economic news heavily favors a direction, it can override the technical math entirely.
     
     You must respond in pure JSON format containing exactly two keys:
     1. "verdict": Exactly one word ("BUY" or "SELL").
-    2. "reasoning": A strict 1 to 2 sentence explanation. 
+    2. "reasoning": A strict 2 to 3 sentence explanation. 
     
-    CRITICAL INSTRUCTIONS FOR YOUR REASONING:
-    - You MUST explicitly name the asset ({symbol}).
-    - You MUST explicitly state the time horizon (e.g., "Over the next {timeframe_text}...").
-    - You MUST quote at least one specific keyword or phrase from the Breaking News.
-    - You MUST cite at least one specific number from the Technical Basis.
+    CRITICAL INSTRUCTIONS:
+    - You MUST explain how the Macro timeframe interacted with the Micro timeframe in your decision.
+    - You MUST factor in the news.
+    - NEVER output "HOLD".
     """
 
     url = "http://localhost:11434/api/generate"
-    
     payload = {
         "model": "gemma3:4b",   
         "prompt": system_prompt,
         "stream": False,
         "format": "json",       
-        "options": {
-            "temperature": 0.0, 
-            "num_thread": 4     
-        }
+        "options": {"temperature": 0.0, "num_thread": 4}
     }
 
     try:
         response = requests.post(url, json=payload, timeout=60)
         data = response.json()
         raw_response = data.get("response", "{}")
-        
         ai_data = json.loads(raw_response)
         
         verdict = ai_data.get("verdict", "").strip().upper()
-        reasoning = ai_data.get("reasoning", "No reasoning provided.")
-        
+        # Fallback strictly to Micro trend if the AI tries to be sneaky and return something else
         if verdict not in ["BUY", "SELL"]:
-            verdict = historical_decision
+            verdict = micro_data["decision"]
             
-        return verdict, reasoning
-        
+        return verdict, ai_data.get("reasoning", "No reasoning provided.")
     except Exception as e:
         print(f"Ollama error: {e}")
-        return historical_decision, f"AI offline. Defaulting to historical math for {symbol} over the next {timeframe_text}."
+        return micro_data["decision"], "AI offline. Defaulting to Micro technical math."
 
-# --- NEW: Endpoint now accepts a 'timeframe' variable ---
 @app.get("/api/signal")
 def get_market_signal(symbol: str = "BTCUSD", timeframe: str = "1h"):
     try:
         target_symbol = symbol.upper()
         config = get_exchange_config(target_symbol)
         
-        # Grab the correct TradingView interval and text mapping. Fallback to 5m if invalid.
-        tf_data = TIMEFRAME_MAP.get(timeframe.lower(), TIMEFRAME_MAP["1h"])
-
-        handler = TA_Handler(
-            symbol=target_symbol,        
-            screener=config["screener"],      
-            exchange=config["exchange"],     
-            interval=tf_data["tv_interval"]  # Dynamically changing the math timeframe
-        )
+        # 1. Identify Timeframes
+        micro_tf_key = timeframe.lower()
+        macro_tf_key = MACRO_PAIRINGS.get(micro_tf_key, "1d") # Defaults to 1d macro if mapping fails
         
-        analysis = handler.get_analysis()
-        
-        raw_summary = analysis.summary["RECOMMENDATION"]
-        buy_votes = analysis.summary["BUY"]
-        sell_votes = analysis.summary["SELL"]
-        
-        if "BUY" in raw_summary:
-            historical_decision = "BUY"
-        elif "SELL" in raw_summary:
-            historical_decision = "SELL"
-        else:
-            historical_decision = "BUY" if buy_votes > sell_votes else "SELL"
+        micro_tf_data = TIMEFRAME_MAP.get(micro_tf_key, TIMEFRAME_MAP["1h"])
+        macro_tf_data = TIMEFRAME_MAP.get(macro_tf_key, TIMEFRAME_MAP["1d"])
 
-        indicators = analysis.indicators
-        rsi_value = round(indicators.get("RSI", 0), 2)
-        macd_value = round(indicators.get("MACD.macd", 0), 2)
-        ema_20 = round(indicators.get("EMA20", 0), 2)
-        current_price = round(indicators.get("close", 0), 2)
+        # 2. Fetch Math for BOTH Timeframes cleanly
+        micro_data = fetch_technical_data(config, micro_tf_data)
+        macro_data = fetch_technical_data(config, macro_tf_data)
 
-        if rsi_value > 70:
-            rsi_reason = f"RSI is {rsi_value} (Overbought)."
-        elif rsi_value < 30:
-            rsi_reason = f"RSI is {rsi_value} (Oversold)."
-        else:
-            rsi_reason = f"RSI is {rsi_value} (Neutral)."
-
-        macd_reason = f"MACD Bearish ({macd_value})." if macd_value < 0 else f"MACD Bullish ({macd_value})."
-        trend_reason = f"Price below 20 EMA." if current_price < ema_20 else f"Price above 20 EMA."
-        
-        detailed_basis = f"{trend_reason} {macd_reason} {rsi_reason}"
-
+        # 3. Fetch News
         headlines = get_latest_headlines()
 
-        # Pass the human-readable timeframe text (e.g., "1 hour") to the AI
-        final_verdict, ai_reasoning = ask_ollama(target_symbol, tf_data["text"], historical_decision, detailed_basis, headlines)
+        # 4. Feed everything to the AI
+        final_verdict, ai_reasoning = ask_ollama(
+            target_symbol, 
+            micro_tf_data["text"], 
+            macro_tf_data["text"], 
+            micro_data, 
+            macro_data, 
+            headlines
+        )
         
         return {
             "symbol": target_symbol, 
-            "timeframe_analyzed": tf_data["text"],
-            "current_price": current_price,
-            "historical_decision": historical_decision, 
-            "technical_basis": detailed_basis,
+            "current_price": micro_data["price"],
+            "analysis_timeframes": {
+                "micro_entry": micro_tf_data["text"],
+                "macro_trend": macro_tf_data["text"]
+            },
+            "macro_technical_state": {
+                "decision": macro_data["decision"],
+                "basis": macro_data["basis"],
+                "process": macro_data["process"]
+            },
+            "micro_technical_state": {
+                "decision": micro_data["decision"],
+                "basis": micro_data["basis"],
+                "process": micro_data["process"]
+            },
             "news_context": headlines,
             "ai_reasoning": ai_reasoning,
             "final_ai_verdict": final_verdict
