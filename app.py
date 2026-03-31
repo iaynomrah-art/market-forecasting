@@ -1,3 +1,4 @@
+import os
 import json
 import requests
 import feedparser
@@ -128,7 +129,7 @@ def ask_ollama(symbol, micro_tf, macro_tf, micro_data, macro_data, headlines):
     - NEVER output "HOLD".
     """
 
-    url = "http://localhost:11434/api/generate"
+    url = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
     payload = {
         "model": "gemma3:4b",   
         "prompt": system_prompt,
@@ -161,7 +162,7 @@ def get_market_signal(symbol: str = "BTCUSD", timeframe: str = "1h"):
         
         # 1. Identify Timeframes
         micro_tf_key = timeframe.lower()
-        macro_tf_key = MACRO_PAIRINGS.get(micro_tf_key, "1d") # Defaults to 1d macro if mapping fails
+        macro_tf_key = MACRO_PAIRINGS.get(micro_tf_key, "1h") # Defaults to 1d macro if mapping fails
         
         micro_tf_data = TIMEFRAME_MAP.get(micro_tf_key, TIMEFRAME_MAP["1h"])
         macro_tf_data = TIMEFRAME_MAP.get(macro_tf_key, TIMEFRAME_MAP["1d"])
