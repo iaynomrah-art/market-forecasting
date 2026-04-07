@@ -84,10 +84,15 @@ def fetch_technical_data(config, tf_data):
     macd = round(ind.get("MACD.macd", 0), 2)
     ema_20 = round(ind.get("EMA20", 0), 2)
     
-    # NEW INCITE-STYLE INDICATORS
     sma_200 = round(ind.get("SMA200", 0), 2)
     sma_50 = round(ind.get("SMA50", 0), 2)
-    atr = round(ind.get("ATR", 0), 2) # Used to calculate dynamic Stop Loss
+    
+    # NEW: ATR with a mathematical safety fallback to prevent 0-value crashes
+    raw_atr = ind.get("ATR")
+    if raw_atr is None or raw_atr == 0:
+        atr = round(price * 0.002, 2) # Fallback to 0.2% of current price
+    else:
+        atr = round(raw_atr, 2)
 
     rsi_txt = f"RSI {rsi} (Overbought)" if rsi > 70 else f"RSI {rsi} (Oversold)" if rsi < 30 else f"RSI {rsi} (Neutral)"
     macd_txt = f"MACD Bearish ({macd})" if macd < 0 else f"MACD Bullish ({macd})"
@@ -195,31 +200,7 @@ def get_market_signal(symbol: str = "XAUUSD", timeframe: str = "1h"):
         headlines = get_latest_headlines()
         current_utc_time = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
 
-        # ---------------------------------------------------------
-        # VOLATILITY GATE: Protect the Hedge from Chop
-        # ---------------------------------------------------------
-        if micro_data["decision"] != macro_data["decision"] and (45 <= micro_data["raw_rsi"] <= 55):
-            return {
-                "symbol": target_symbol, 
-                "timeframe": micro_tf_data["text"],
-                "signal": {
-                    "action": "RANGING",
-                    "entry": micro_data["price"],
-                    "target": None,
-                    "stop_loss": None,
-                    "confidence": 0
-                },
-                "technical_context": {
-                    "current_price": micro_data["price"],
-                    "sma_200": micro_data["sma_200"],
-                    "volatility_atr": micro_data["atr"],
-                    "micro_verdict": micro_data["decision"],
-                    "macro_verdict": macro_data["decision"]
-                },
-                "ai_reasoning": "VOLATILITY WARNING: Macro and Micro trends are conflicting, and RSI is entirely neutral. Hedging in this environment is high risk as price will likely chop and fail to hit Take Profit on either side."
-            }
-
-        # 4. Feed everything to the AI
+        # 4. Feed everything directly to the AI
         ai_response = ask_ollama(
             target_symbol, 
             micro_tf_data["text"], 
