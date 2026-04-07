@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+tradingview_ta
+feedparser
+requests
