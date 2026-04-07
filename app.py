@@ -27,13 +27,12 @@ TIMEFRAME_MAP = {
     "1M": {"tv_interval": Interval.INTERVAL_1_MONTH, "text": "1 month"}
 }
 
-# --- Automatically pairs a Micro timeframe with its logical Macro timeframe ---
 MACRO_PAIRINGS = {
-    "5m": "1h",   # 5m micro looks at 1h macro
-    "15m": "4h",  # 15m micro looks at 4h macro
-    "1h": "1d",   # 1h micro looks at Daily macro
-    "4h": "1W",   # 4h micro looks at Weekly macro
-    "1d": "1M"    # Daily micro looks at Monthly macro
+    "5m": "1h",   
+    "15m": "4h",  
+    "1h": "1d",   
+    "4h": "1W",   
+    "1d": "1M"    
 }
 
 def get_latest_headlines():
@@ -50,7 +49,7 @@ def get_latest_headlines():
 
 def get_exchange_config(symbol):
     symbol = symbol.upper()
-    if symbol == "XAUUSD" or symbol == "GOLD":
+    if symbol in ["XAUUSD", "GOLD"]:
         return {"tv_symbol": "GOLD", "screener": "cfd", "exchange": "TVC"} 
     elif symbol == "BTCUSD":
         return {"tv_symbol": "BTCUSD", "screener": "crypto", "exchange": "COINBASE"}
@@ -79,7 +78,7 @@ def fetch_technical_data(config, tf_data):
     math_process = f"Analyzed {total} indicators. Results: {buy_votes} BUY, {sell_votes} SELL, {neutral_votes} NEUTRAL. Verdict: {decision}."
 
     ind = analysis.indicators
-    rsi = round(ind.get("RSI", 0), 2)
+    rsi = round(ind.get("RSI", 50), 2) # Default to 50 if missing
     macd = round(ind.get("MACD.macd", 0), 2)
     ema_20 = round(ind.get("EMA20", 0), 2)
     price = round(ind.get("close", 0), 2)
@@ -92,11 +91,11 @@ def fetch_technical_data(config, tf_data):
         "decision": decision,
         "process": math_process,
         "basis": f"{trend_txt}. {macd_txt}. {rsi_txt}.",
-        "price": price
+        "price": price,
+        "raw_rsi": rsi # Extracted for the Python Volatility Gate
     }
 
 def ask_ollama(symbol, micro_tf, macro_tf, micro_data, macro_data, headlines):
-    """Upgraded Prompt: Forced Binary Decision (No Hold)"""
     system_prompt = f"""You are a quantitative trading AI analyzing {symbol}.
     Asset Profile: {symbol} 
     
@@ -118,7 +117,7 @@ def ask_ollama(symbol, micro_tf, macro_tf, micro_data, macro_data, headlines):
     2. THE TIE-BREAKER: If Macro and Micro disagree, the MACRO TREND ({macro_tf}) always wins unless there is breaking news in the opposite direction. Do not trade against the Macro trend on a whim.
     3. RSI EXTREMES: If the Micro RSI is Overbought (>70), heavily lean towards SELL. If Oversold (<30), heavily lean towards BUY.
     
-    Respond strictly in JSON:
+    Respond strictly in JSON format containing exactly two keys:
     {{
       "verdict": "BUY" or "SELL",
       "reasoning": "Strict 2-sentence explanation citing the Macro trend and RSI."
@@ -131,7 +130,7 @@ def ask_ollama(symbol, micro_tf, macro_tf, micro_data, macro_data, headlines):
         "prompt": system_prompt,
         "stream": False,
         "format": "json",       
-        "options": {"temperature": 0.0, "num_thread": 4}
+        "options": {"temperature": 0.0, "num_thread": 4} # Temp 0.0 ensures highly logical, repeatable outputs
     }
 
     try:
@@ -141,14 +140,15 @@ def ask_ollama(symbol, micro_tf, macro_tf, micro_data, macro_data, headlines):
         ai_data = json.loads(raw_response)
         
         verdict = ai_data.get("verdict", "").strip().upper()
-        # Fallback strictly to Micro trend if the AI tries to be sneaky and return something else
+        
+        # Strict fallback to prevent hallucinations
         if verdict not in ["BUY", "SELL"]:
-            verdict = micro_data["decision"]
+            verdict = macro_data["decision"] # Default to MACRO trend if AI fails
             
-        return verdict, ai_data.get("reasoning", "No reasoning provided.")
+        return verdict, ai_data.get("reasoning", "AI generated standard signal based on technicals.")
     except Exception as e:
         print(f"Ollama error: {e}")
-        return micro_data["decision"], "AI offline. Defaulting to Micro technical math."
+        return macro_data["decision"], "AI offline or failed. Defaulting to Macro technical math."
 
 @app.get("/api/signal")
 def get_market_signal(symbol: str = "BTCUSD", timeframe: str = "1h"):
@@ -158,19 +158,31 @@ def get_market_signal(symbol: str = "BTCUSD", timeframe: str = "1h"):
         
         # 1. Identify Timeframes
         micro_tf_key = timeframe.lower()
-        macro_tf_key = MACRO_PAIRINGS.get(micro_tf_key, "1h") # Defaults to 1d macro if mapping fails
+        macro_tf_key = MACRO_PAIRINGS.get(micro_tf_key, "1d") 
         
         micro_tf_data = TIMEFRAME_MAP.get(micro_tf_key, TIMEFRAME_MAP["1h"])
         macro_tf_data = TIMEFRAME_MAP.get(macro_tf_key, TIMEFRAME_MAP["1d"])
 
-        # 2. Fetch Math for BOTH Timeframes cleanly
+        # 2. Fetch Math
         micro_data = fetch_technical_data(config, micro_tf_data)
         macro_data = fetch_technical_data(config, macro_tf_data)
 
         # 3. Fetch News
         headlines = get_latest_headlines()
 
-        # 4. Feed everything to the AI
+        # ---------------------------------------------------------
+        # VOLATILITY GATE: Protect the Hedge from Chop
+        # ---------------------------------------------------------
+        # If trends conflict AND momentum is dead (RSI between 45 and 55)
+        if micro_data["decision"] != macro_data["decision"] and (45 <= micro_data["raw_rsi"] <= 55):
+            return {
+                "symbol": target_symbol, 
+                "current_price": micro_data["price"],
+                "final_ai_verdict": "RANGING", # Frontend should catch this and disable the button
+                "ai_reasoning": "VOLATILITY WARNING: Macro and Micro trends are conflicting, and RSI is entirely neutral. Hedging in this environment is high risk as price will likely chop and fail to hit Take Profit on either side."
+            }
+
+        # 4. Feed everything to the AI if it passes the Volatility Gate
         final_verdict, ai_reasoning = ask_ollama(
             target_symbol, 
             micro_tf_data["text"], 
