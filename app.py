@@ -2,6 +2,7 @@ import os
 import json
 import requests
 import feedparser
+from datetime import datetime, timezone
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from tradingview_ta import TA_Handler, Interval
@@ -92,35 +93,33 @@ def fetch_technical_data(config, tf_data):
         "process": math_process,
         "basis": f"{trend_txt}. {macd_txt}. {rsi_txt}.",
         "price": price,
-        "raw_rsi": rsi # Extracted for the Python Volatility Gate
+        "raw_rsi": rsi 
     }
 
-def ask_ollama(symbol, micro_tf, macro_tf, micro_data, macro_data, headlines):
+def ask_ollama(symbol, micro_tf, macro_tf, micro_data, macro_data, headlines, current_utc_time):
     system_prompt = f"""You are a quantitative trading AI analyzing {symbol}.
-    Asset Profile: {symbol} 
+    
+    CURRENT SYSTEM TIME: {current_utc_time}
     
     [1] MACRO TREND (Primary Direction - {macro_tf}):
     - Verdict: {macro_data['decision']}
-    - Basis: {macro_data['basis']}
     
     [2] MICRO TREND (Entry Momentum - {micro_tf}):
     - Verdict: {micro_data['decision']}
-    - Basis: {micro_data['basis']}
     
     [3] CATALYSTS (News): 
     {headlines}
     
-    TASK: You must output ONLY "BUY" or "SELL". 
-    
     DECISION LOGIC (Follow Strictly):
-    1. CONFLUENCE: If Macro and Micro both say BUY, output BUY. If both say SELL, output SELL.
-    2. THE TIE-BREAKER: If Macro and Micro disagree, the MACRO TREND ({macro_tf}) always wins unless there is breaking news in the opposite direction. Do not trade against the Macro trend on a whim.
-    3. RSI EXTREMES: If the Micro RSI is Overbought (>70), heavily lean towards SELL. If Oversold (<30), heavily lean towards BUY.
+    1. CONFLUENCE: If Macro is BUY and Micro is BUY, output "BUY". If Macro is SELL and Micro is SELL, output "SELL".
+    2. CONFLICT: If Macro and Micro disagree, YOU MUST CHOOSE THE MACRO TREND. The Macro trend ({macro_tf}) is the absolute authority.
+    3. RSI OVERRIDE: Ignore the trend ONLY if the Micro RSI is extreme. If Micro RSI > 70, output "SELL". If Micro RSI < 30, output "BUY".
+    4. NEWS RECENCY: Compare the News timestamps to the CURRENT SYSTEM TIME. If the news is more than 4 hours old, consider it "priced in" and ignore it. Only factor in fresh news if it heavily aligns with the Macro trend.
     
     Respond strictly in JSON format containing exactly two keys:
     {{
       "verdict": "BUY" or "SELL",
-      "reasoning": "Strict 2-sentence explanation citing the Macro trend and RSI."
+      "reasoning": "Strict 2-sentence explanation citing the Macro trend, RSI, and relevant fresh news."
     }}
     """
 
@@ -130,7 +129,7 @@ def ask_ollama(symbol, micro_tf, macro_tf, micro_data, macro_data, headlines):
         "prompt": system_prompt,
         "stream": False,
         "format": "json",       
-        "options": {"temperature": 0.0, "num_thread": 4} # Temp 0.0 ensures highly logical, repeatable outputs
+        "options": {"temperature": 0.0, "num_thread": 4} # Temp 0.0 forces logic over creativity
     }
 
     try:
@@ -143,9 +142,9 @@ def ask_ollama(symbol, micro_tf, macro_tf, micro_data, macro_data, headlines):
         
         # Strict fallback to prevent hallucinations
         if verdict not in ["BUY", "SELL"]:
-            verdict = macro_data["decision"] # Default to MACRO trend if AI fails
+            verdict = macro_data["decision"] 
             
-        return verdict, ai_data.get("reasoning", "AI generated standard signal based on technicals.")
+        return verdict, ai_data.get("reasoning", "AI generated standard signal based on strict technical rules.")
     except Exception as e:
         print(f"Ollama error: {e}")
         return macro_data["decision"], "AI offline or failed. Defaulting to Macro technical math."
@@ -167,8 +166,9 @@ def get_market_signal(symbol: str = "BTCUSD", timeframe: str = "1h"):
         micro_data = fetch_technical_data(config, micro_tf_data)
         macro_data = fetch_technical_data(config, macro_tf_data)
 
-        # 3. Fetch News
+        # 3. Fetch News & Current Time
         headlines = get_latest_headlines()
+        current_utc_time = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
 
         # ---------------------------------------------------------
         # VOLATILITY GATE: Protect the Hedge from Chop
@@ -178,7 +178,7 @@ def get_market_signal(symbol: str = "BTCUSD", timeframe: str = "1h"):
             return {
                 "symbol": target_symbol, 
                 "current_price": micro_data["price"],
-                "final_ai_verdict": "RANGING", # Frontend should catch this and disable the button
+                "final_ai_verdict": "RANGING", # Frontend should catch this and disable the execution button
                 "ai_reasoning": "VOLATILITY WARNING: Macro and Micro trends are conflicting, and RSI is entirely neutral. Hedging in this environment is high risk as price will likely chop and fail to hit Take Profit on either side."
             }
 
@@ -189,7 +189,8 @@ def get_market_signal(symbol: str = "BTCUSD", timeframe: str = "1h"):
             macro_tf_data["text"], 
             micro_data, 
             macro_data, 
-            headlines
+            headlines,
+            current_utc_time
         )
         
         return {
