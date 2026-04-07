@@ -97,36 +97,32 @@ def fetch_technical_data(config, tf_data):
 
 def ask_ollama(symbol, micro_tf, macro_tf, micro_data, macro_data, headlines):
     """Upgraded Prompt: Forced Binary Decision (No Hold)"""
-    system_prompt = f"""You are an elite, multi-timeframe {symbol} quantitative trading AI. Your job is to analyze the macro trend, the micro entry, and fundamental news to make a highly accurate trading decision.
+    system_prompt = f"""You are a quantitative trading AI analyzing {symbol}.
+    Asset Profile: {symbol} 
     
-    Asset Profile: {symbol} (If XAU/Gold, it is a safe-haven. If BTC, it is a risk-on asset).
-    
-    [1] MACRO TREND (The Big Picture - {macro_tf}):
+    [1] MACRO TREND (Primary Direction - {macro_tf}):
     - Verdict: {macro_data['decision']}
     - Basis: {macro_data['basis']}
     
-    [2] MICRO TREND (The Entry Setup - {micro_tf}):
+    [2] MICRO TREND (Entry Momentum - {micro_tf}):
     - Verdict: {micro_data['decision']}
     - Basis: {micro_data['basis']}
     
-    [3] FUNDAMENTAL CATALYSTS (Recent News): 
+    [3] CATALYSTS (News): 
     {headlines}
     
-    You must choose ONLY "BUY" or "SELL". There is no "HOLD" option. You must make a definitive call.
+    TASK: You must output ONLY "BUY" or "SELL". 
     
-    YOUR DECISION RULES:
-    1. Trend Alignment: If the Macro Trend and Micro Trend align, that is your primary signal.
-    2. The Forced Gamble (Contradiction): If the Macro says BUY, but the Micro says SELL (or vice versa), you must weigh the technical momentum and the news to decide if it is a "BUY" (e.g., buying the dip) or a "SELL" (e.g., trend reversal). You MUST pick a side.
-    3. The Catalyst Override: If fresh, highly impactful geopolitical/economic news heavily favors a direction, it can override the technical math entirely.
+    DECISION LOGIC (Follow Strictly):
+    1. CONFLUENCE: If Macro and Micro both say BUY, output BUY. If both say SELL, output SELL.
+    2. THE TIE-BREAKER: If Macro and Micro disagree, the MACRO TREND ({macro_tf}) always wins unless there is breaking news in the opposite direction. Do not trade against the Macro trend on a whim.
+    3. RSI EXTREMES: If the Micro RSI is Overbought (>70), heavily lean towards SELL. If Oversold (<30), heavily lean towards BUY.
     
-    You must respond in pure JSON format containing exactly two keys:
-    1. "verdict": Exactly one word ("BUY" or "SELL").
-    2. "reasoning": A strict 2 to 3 sentence explanation. 
-    
-    CRITICAL INSTRUCTIONS:
-    - You MUST explain how the Macro timeframe interacted with the Micro timeframe in your decision.
-    - You MUST factor in the news.
-    - NEVER output "HOLD".
+    Respond strictly in JSON:
+    {{
+      "verdict": "BUY" or "SELL",
+      "reasoning": "Strict 2-sentence explanation citing the Macro trend and RSI."
+    }}
     """
 
     url = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
