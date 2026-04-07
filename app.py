@@ -79,47 +79,65 @@ def fetch_technical_data(config, tf_data):
     math_process = f"Analyzed {total} indicators. Results: {buy_votes} BUY, {sell_votes} SELL, {neutral_votes} NEUTRAL. Verdict: {decision}."
 
     ind = analysis.indicators
+    price = round(ind.get("close", 0), 2)
     rsi = round(ind.get("RSI", 50), 2) # Default to 50 if missing
     macd = round(ind.get("MACD.macd", 0), 2)
     ema_20 = round(ind.get("EMA20", 0), 2)
-    price = round(ind.get("close", 0), 2)
+    
+    # NEW INCITE-STYLE INDICATORS
+    sma_200 = round(ind.get("SMA200", 0), 2)
+    sma_50 = round(ind.get("SMA50", 0), 2)
+    atr = round(ind.get("ATR", 0), 2) # Used to calculate dynamic Stop Loss
 
     rsi_txt = f"RSI {rsi} (Overbought)" if rsi > 70 else f"RSI {rsi} (Oversold)" if rsi < 30 else f"RSI {rsi} (Neutral)"
     macd_txt = f"MACD Bearish ({macd})" if macd < 0 else f"MACD Bullish ({macd})"
-    trend_txt = f"Price below 20 EMA" if price < ema_20 else f"Price above 20 EMA"
+    trend_txt = f"Price vs 200 SMA: {'Above' if price > sma_200 else 'Below'}. Price vs 50 SMA: {'Above' if price > sma_50 else 'Below'}"
     
     return {
         "decision": decision,
         "process": math_process,
         "basis": f"{trend_txt}. {macd_txt}. {rsi_txt}.",
         "price": price,
-        "raw_rsi": rsi 
+        "raw_rsi": rsi,
+        "atr": atr,
+        "sma_200": sma_200
     }
 
 def ask_ollama(symbol, micro_tf, macro_tf, micro_data, macro_data, headlines, current_utc_time):
-    system_prompt = f"""You are a quantitative trading AI analyzing {symbol}.
+    current_price = micro_data['price']
+    atr = micro_data['atr']
+    
+    # Pre-calculate ideal risk/reward parameters to prevent LLM math errors
+    buy_stop = round(current_price - (1.5 * atr), 2)
+    buy_target = round(current_price + (2.0 * atr), 2)
+    sell_stop = round(current_price + (1.5 * atr), 2)
+    sell_target = round(current_price - (2.0 * atr), 2)
+    
+    system_prompt = f"""You are a strict quantitative trading AI analyzing {symbol} for a short-term ({micro_tf}) execution bot.
     
     CURRENT SYSTEM TIME: {current_utc_time}
+    CURRENT PRICE: {current_price}
+    200 SMA (Long Term Trend): {micro_data['sma_200']}
+    ATR (Volatility): {atr}
     
-    [1] MACRO TREND (Primary Direction - {macro_tf}):
-    - Verdict: {macro_data['decision']}
+    [1] MACRO TREND ({macro_tf}): {macro_data['decision']}
+    [2] MICRO TREND ({micro_tf}): {micro_data['decision']}
     
-    [2] MICRO TREND (Entry Momentum - {micro_tf}):
-    - Verdict: {micro_data['decision']}
+    DECISION LOGIC (Execute strictly for short-term {micro_tf} horizon):
+    1. TREND ALIGNMENT: Prioritize the Micro Trend ({micro_tf}) if the current price is above the 200 SMA (for BUY) or below the 200 SMA (for SELL). 
+    2. RISK/REWARD SELECTION: 
+       - If you output BUY: Set stop_loss to {buy_stop} and target_price to {buy_target}.
+       - If you output SELL: Set stop_loss to {sell_stop} and target_price to {sell_target}.
+    3. NEWS CUES: Only reference the provided headlines if they explicitly invalidate the technical setup. Otherwise, ignore them.
     
-    [3] CATALYSTS (News): 
-    {headlines}
-    
-    DECISION LOGIC (Follow Strictly):
-    1. CONFLUENCE: If Macro is BUY and Micro is BUY, output "BUY". If Macro is SELL and Micro is SELL, output "SELL".
-    2. CONFLICT: If Macro and Micro disagree, YOU MUST CHOOSE THE MACRO TREND. The Macro trend ({macro_tf}) is the absolute authority.
-    3. RSI OVERRIDE: Ignore the trend ONLY if the Micro RSI is extreme. If Micro RSI > 70, output "SELL". If Micro RSI < 30, output "BUY".
-    4. NEWS RECENCY: Compare the News timestamps to the CURRENT SYSTEM TIME. If the news is more than 4 hours old, consider it "priced in" and ignore it. Only factor in fresh news if it heavily aligns with the Macro trend.
-    
-    Respond strictly in JSON format containing exactly two keys:
+    Respond strictly in JSON format matching this exact schema. Do not output markdown code blocks, just the raw JSON:
     {{
       "verdict": "BUY" or "SELL",
-      "reasoning": "Strict 2-sentence explanation citing the Macro trend, RSI, and relevant fresh news."
+      "entry_price": {current_price},
+      "target_price": <number>,
+      "stop_loss": <number>,
+      "confidence_score": <number 1-100 based on indicator confluence>,
+      "reasoning": "Short 2-sentence explanation citing the 200 SMA, current momentum, and calculated risk parameters."
     }}
     """
 
@@ -129,7 +147,7 @@ def ask_ollama(symbol, micro_tf, macro_tf, micro_data, macro_data, headlines, cu
         "prompt": system_prompt,
         "stream": False,
         "format": "json",       
-        "options": {"temperature": 0.0, "num_thread": 4} # Temp 0.0 forces logic over creativity
+        "options": {"temperature": 0.0, "num_thread": 4} 
     }
 
     try:
@@ -138,19 +156,26 @@ def ask_ollama(symbol, micro_tf, macro_tf, micro_data, macro_data, headlines, cu
         raw_response = data.get("response", "{}")
         ai_data = json.loads(raw_response)
         
-        verdict = ai_data.get("verdict", "").strip().upper()
-        
-        # Strict fallback to prevent hallucinations
-        if verdict not in ["BUY", "SELL"]:
-            verdict = macro_data["decision"] 
+        # Fallback safety checks
+        if ai_data.get("verdict", "").strip().upper() not in ["BUY", "SELL"]:
+            ai_data["verdict"] = micro_data["decision"]
             
-        return verdict, ai_data.get("reasoning", "AI generated standard signal based on strict technical rules.")
+        return ai_data
     except Exception as e:
         print(f"Ollama error: {e}")
-        return macro_data["decision"], "AI offline or failed. Defaulting to Macro technical math."
+        # Return a structurally sound fallback if Ollama crashes
+        fallback_verdict = micro_data["decision"]
+        return {
+            "verdict": fallback_verdict, 
+            "entry_price": current_price,
+            "target_price": buy_target if fallback_verdict == "BUY" else sell_target,
+            "stop_loss": buy_stop if fallback_verdict == "BUY" else sell_stop,
+            "confidence_score": 50,
+            "reasoning": "AI offline. Defaulting to standard technicals."
+        }
 
 @app.get("/api/signal")
-def get_market_signal(symbol: str = "BTCUSD", timeframe: str = "1h"):
+def get_market_signal(symbol: str = "XAUUSD", timeframe: str = "1h"):
     try:
         target_symbol = symbol.upper()
         config = get_exchange_config(target_symbol)
@@ -173,17 +198,29 @@ def get_market_signal(symbol: str = "BTCUSD", timeframe: str = "1h"):
         # ---------------------------------------------------------
         # VOLATILITY GATE: Protect the Hedge from Chop
         # ---------------------------------------------------------
-        # If trends conflict AND momentum is dead (RSI between 45 and 55)
         if micro_data["decision"] != macro_data["decision"] and (45 <= micro_data["raw_rsi"] <= 55):
             return {
                 "symbol": target_symbol, 
-                "current_price": micro_data["price"],
-                "final_ai_verdict": "RANGING", # Frontend should catch this and disable the execution button
+                "timeframe": micro_tf_data["text"],
+                "signal": {
+                    "action": "RANGING",
+                    "entry": micro_data["price"],
+                    "target": None,
+                    "stop_loss": None,
+                    "confidence": 0
+                },
+                "technical_context": {
+                    "current_price": micro_data["price"],
+                    "sma_200": micro_data["sma_200"],
+                    "volatility_atr": micro_data["atr"],
+                    "micro_verdict": micro_data["decision"],
+                    "macro_verdict": macro_data["decision"]
+                },
                 "ai_reasoning": "VOLATILITY WARNING: Macro and Micro trends are conflicting, and RSI is entirely neutral. Hedging in this environment is high risk as price will likely chop and fail to hit Take Profit on either side."
             }
 
-        # 4. Feed everything to the AI if it passes the Volatility Gate
-        final_verdict, ai_reasoning = ask_ollama(
+        # 4. Feed everything to the AI
+        ai_response = ask_ollama(
             target_symbol, 
             micro_tf_data["text"], 
             macro_tf_data["text"], 
@@ -194,25 +231,23 @@ def get_market_signal(symbol: str = "BTCUSD", timeframe: str = "1h"):
         )
         
         return {
-            "symbol": target_symbol, 
-            "current_price": micro_data["price"],
-            "analysis_timeframes": {
-                "micro_entry": micro_tf_data["text"],
-                "macro_trend": macro_tf_data["text"]
+            "symbol": target_symbol,
+            "timeframe": micro_tf_data["text"],
+            "signal": {
+                "action": ai_response.get("verdict"),
+                "entry": ai_response.get("entry_price", micro_data["price"]),
+                "target": ai_response.get("target_price"),
+                "stop_loss": ai_response.get("stop_loss"),
+                "confidence": ai_response.get("confidence_score")
             },
-            "macro_technical_state": {
-                "decision": macro_data["decision"],
-                "basis": macro_data["basis"],
-                "process": macro_data["process"]
+            "technical_context": {
+                "current_price": micro_data["price"],
+                "sma_200": micro_data["sma_200"],
+                "volatility_atr": micro_data["atr"],
+                "micro_verdict": micro_data["decision"],
+                "macro_verdict": macro_data["decision"]
             },
-            "micro_technical_state": {
-                "decision": micro_data["decision"],
-                "basis": micro_data["basis"],
-                "process": micro_data["process"]
-            },
-            "news_context": headlines,
-            "ai_reasoning": ai_reasoning,
-            "final_ai_verdict": final_verdict
+            "ai_reasoning": ai_response.get("reasoning")
         }
         
     except Exception as e:
