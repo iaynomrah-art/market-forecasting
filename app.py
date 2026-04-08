@@ -80,17 +80,16 @@ def fetch_technical_data(config, tf_data):
 
     ind = analysis.indicators
     price = round(ind.get("close", 0), 2)
-    rsi = round(ind.get("RSI", 50), 2) # Default to 50 if missing
+    rsi = round(ind.get("RSI", 50), 2) 
     macd = round(ind.get("MACD.macd", 0), 2)
     ema_20 = round(ind.get("EMA20", 0), 2)
     
     sma_200 = round(ind.get("SMA200", 0), 2)
     sma_50 = round(ind.get("SMA50", 0), 2)
     
-    # NEW: ATR with a mathematical safety fallback to prevent 0-value crashes
     raw_atr = ind.get("ATR")
     if raw_atr is None or raw_atr == 0:
-        atr = round(price * 0.002, 2) # Fallback to 0.2% of current price
+        atr = round(price * 0.002, 2)
     else:
         atr = round(raw_atr, 2)
 
@@ -112,7 +111,6 @@ def ask_ollama(symbol, micro_tf, macro_tf, micro_data, macro_data, headlines, cu
     current_price = micro_data['price']
     atr = micro_data['atr']
     
-    # Pre-calculate ideal risk/reward parameters to prevent LLM math errors
     buy_stop = round(current_price - (1.5 * atr), 2)
     buy_target = round(current_price + (2.0 * atr), 2)
     sell_stop = round(current_price + (1.5 * atr), 2)
@@ -137,12 +135,12 @@ def ask_ollama(symbol, micro_tf, macro_tf, micro_data, macro_data, headlines, cu
     
     Respond strictly in JSON format matching this exact schema. Do not output markdown code blocks, just the raw JSON:
     {{
-      "verdict": "BUY" or "SELL",
+      "verdict": "BUY", // MUST BE EXACTLY ONE WORD: either "BUY" or "SELL". No sentences.
       "entry_price": {current_price},
       "target_price": <number>,
       "stop_loss": <number>,
-      "confidence_score": <number 1-100 based on indicator confluence>,
-      "reasoning": "Short 2-sentence explanation citing the 200 SMA, current momentum, and calculated risk parameters."
+      "confidence_score": <number>,
+      "reasoning": "Short 2-sentence explanation."
     }}
     """
 
@@ -161,14 +159,12 @@ def ask_ollama(symbol, micro_tf, macro_tf, micro_data, macro_data, headlines, cu
         raw_response = data.get("response", "{}")
         ai_data = json.loads(raw_response)
         
-        # Fallback safety checks
         if ai_data.get("verdict", "").strip().upper() not in ["BUY", "SELL"]:
             ai_data["verdict"] = micro_data["decision"]
             
         return ai_data
     except Exception as e:
         print(f"Ollama error: {e}")
-        # Return a structurally sound fallback if Ollama crashes
         fallback_verdict = micro_data["decision"]
         return {
             "verdict": fallback_verdict, 
@@ -185,22 +181,18 @@ def get_market_signal(symbol: str = "XAUUSD", timeframe: str = "1h"):
         target_symbol = symbol.upper()
         config = get_exchange_config(target_symbol)
         
-        # 1. Identify Timeframes
         micro_tf_key = timeframe.lower()
         macro_tf_key = MACRO_PAIRINGS.get(micro_tf_key, "1d") 
         
         micro_tf_data = TIMEFRAME_MAP.get(micro_tf_key, TIMEFRAME_MAP["1h"])
         macro_tf_data = TIMEFRAME_MAP.get(macro_tf_key, TIMEFRAME_MAP["1d"])
 
-        # 2. Fetch Math
         micro_data = fetch_technical_data(config, micro_tf_data)
         macro_data = fetch_technical_data(config, macro_tf_data)
 
-        # 3. Fetch News & Current Time
         headlines = get_latest_headlines()
         current_utc_time = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
 
-        # 4. Feed everything directly to the AI
         ai_response = ask_ollama(
             target_symbol, 
             micro_tf_data["text"], 
@@ -211,24 +203,17 @@ def get_market_signal(symbol: str = "XAUUSD", timeframe: str = "1h"):
             current_utc_time
         )
         
+        # --- NEW STRIPPED DOWN RESPONSE LOGIC ---
+        final_action = ai_response.get("verdict", "").strip().upper()
+        
+        # Fallback in case the LLM still tries to write a sentence
+        if final_action not in ["BUY", "SELL"]:
+            final_action = micro_data["decision"]
+            
         return {
-            "symbol": target_symbol,
-            "timeframe": micro_tf_data["text"],
-            "signal": {
-                "action": ai_response.get("verdict"),
-                "entry": ai_response.get("entry_price", micro_data["price"]),
-                "target": ai_response.get("target_price"),
-                "stop_loss": ai_response.get("stop_loss"),
-                "confidence": ai_response.get("confidence_score")
-            },
-            "technical_context": {
-                "current_price": micro_data["price"],
-                "sma_200": micro_data["sma_200"],
-                "volatility_atr": micro_data["atr"],
-                "micro_verdict": micro_data["decision"],
-                "macro_verdict": macro_data["decision"]
-            },
-            "ai_reasoning": ai_response.get("reasoning")
+            "action": final_action,
+            "target": ai_response.get("target_price"),
+            "stop": ai_response.get("stop_loss")
         }
         
     except Exception as e:
